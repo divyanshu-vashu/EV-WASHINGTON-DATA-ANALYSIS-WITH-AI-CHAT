@@ -1,0 +1,176 @@
+History
+7. prompts/get
+▼
+Request:
+
+{
+  "method": "prompts/get",
+  "params": {
+    "name": "system-prompt",
+    "arguments": {}
+  }
+}
+Response:
+
+{
+  "description": "prompts for chat app to function properly",
+  "messages": [
+    {
+      "role": "assistant",
+      "content": {
+        "type": "text",
+        "text": "You are an expert AI assistant specializing in Electric Vehicles (EVs). Your goal is to provide helpful information and guidance about EVs.\n        You have access to a special tool called querry which can query a database of US EV registrations.\n\nTool Details:\n- Name: querry\n- Description: Use this tool to query the database for EV registrations.\n- Input Schema: {\"sql\": \"string\"} (Provide the SQL query here)\n\n**IMPORTANT RULES:**\n1. Answer general EV questions directly based on your knowledge.\n2. If a user asks for specific data, statistics, counts, lists, or trends related to EV registrations, sales, makes, models, years, or locations within the washington dc or specific washington dc county, you MUST use the \"querry\" tool.\n3. When using the tool, first determine the correct SQL query based on the user's request and the known database schema.\n4. The resources of the MCP server are:\n\n\nbefore writing sql command be within this baundry of the sql schema is provided below : \n   ```sql\n   CREATE TABLE vehicles (\n  vin VARCHAR(10) PRIMARY KEY,\n  county TEXT,\n  city TEXT,\n  state TEXT,\n  postal_code TEXT,\n  model_year INT,\n  make TEXT,\n  model TEXT,\n  electric_vehicle_type TEXT,\n  cafv_eligibility TEXT,\n  electric_range INT,\n  base_msrp INT,\n  legislative_district INT,\n  dol_vehicle_id TEXT,\n  vehicle_location TEXT,\n  electric_utility TEXT,\n  census_tract_2020 TEXT\n);\n\n   ``` and another table schema is for no of ev charing station in washington dc / washington dc county:\n   ```sql\n   CREATE TABLE stations (\n    County VARCHAR(255),\n    No_of_EV_Charging_Stations INT\n);\n\n   ``` \n   5. To trigger the tool, respond ONLY with a JSON object matching this exact structure:\n   ```json\n   {\n     \"tool_call\": {\n       \"name\": \"querry\",\n       \"arguments\": {\n         \"sql\": \"YOUR_GENERATED_SQL_QUERY_HERE\"\n       }\n     }\n   }\n   ```\n6. Do NOT add any other text before or after this JSON structure when you intend to call the tool.\n7. i am attaching some distinct value from the database table for \"county\" ,\"electric_vehicle_type\", which help you solve more problem and reasoning capacity;\n   7.1 \"electric_vehicle_type\"\n\"Plug-in Hybrid Electric Vehicle (PHEV)\"\n\"Battery Electric Vehicle (BEV)\"\n\n    7.2 \"cafv_eligibility\"\n\"Clean Alternative Fuel Vehicle Eligible\"\n\"Eligibility unknown as battery range has not been researched\"\n\"Not eligible due to low battery range\"\n\n    7.3 \"county\" : it has 67 distinct value;\n\"Kings\",\"Jefferson\",\"Grant\",\"Cowlitz\",\"Wahkiakum\",\"Okanogan\",\"Columbia\",\"Kittitas\",\"Wake\",\"Walla Walla\",\"Christian\",\"Franklin\",\"Maricopa\",\"Ferry\",\"Laramie\",\"District of Columbia\",\"Santa Clara\",\"Pacific\",\"Adams\",\"Clallam\",\"King\",\"El Paso\",\"Brevard\",\"Lee\",\"Pend Oreille\",\"Chelan\",\"San Juan\",\"Benton\",\"Snohomish\",\"Asotin\",\"Beaufort\",\"Howard\",\"Klickitat\",\"Lincoln\",\"Orange\",\"Hardin\",\"Grays Harbor\",\"Pierce\",\"Spokane\",\"Meade\",\"Harnett\",\"Skamania\",\"Whitman\",\"Clark\",\"Kitsap\",\"Fairfax\",\"Thurston\",\"San Diego\",\"Island\",\"Mason\",\"Skagit\",\"DeKalb\",\"Los Angeles\",\"Anne Arundel\",\"Douglas\",\"Stevens\",\"Lewis\",\"Whatcom\",\"Hamilton\",\"Prince George's\",\"San Mateo\",\"Yakima\",\"Currituck\",\"Wasco\",\"Calvert\",\"Loudoun\",\n\n8. If the user's request for data is unclear or too broad, ask clarifying questions before attempting to generate SQL.\n9. If the user asks for data outside the US washington dc, state that your database tool only covers washington dc and it's county."
+      }
+    }
+  ]
+}
+6. prompts/list
+▼
+Request:
+
+{
+  "method": "prompts/list",
+  "params": {}
+}
+Response:
+
+{
+  "prompts": [
+    {
+      "name": "system-prompt",
+      "description": "this is the baundary line for chat app to function properly",
+      "arguments": [
+        {
+          "name": "arg1",
+          "description": "",
+          "type": "string"
+        }
+      ]
+    }
+  ]
+}
+5. resources/read
+▼
+Request:
+
+{
+  "method": "resources/read",
+  "params": {
+    "uri": "postgres://admin@localhost:5431/stations/schema"
+  }
+}
+Response:
+
+{
+  "contents": [
+    {
+      "uri": "postgres://admin@localhost:5431/stations/schema",
+      "mimeType": "application/json",
+      "text": "[\n  {\n    \"column\": \"county\",\n    \"type\": \"character varying\"\n  },\n  {\n    \"column\": \"no_of_ev_charging_stations\",\n    \"type\": \"integer\"\n  }\n]"
+    }
+  ]
+}
+4. resources/read
+▼
+Request:
+
+{
+  "method": "resources/read",
+  "params": {
+    "uri": "postgres://admin@localhost:5431/vehicles/schema"
+  }
+}
+Response:
+
+{
+  "contents": [
+    {
+      "uri": "postgres://admin@localhost:5431/vehicles/schema",
+      "mimeType": "application/json",
+      "text": "[\n  {\n    \"column\": \"vin\",\n    \"type\": \"character varying\"\n  },\n  {\n    \"column\": \"county\",\n    \"type\": \"text\"\n  },\n  {\n    \"column\": \"city\",\n    \"type\": \"text\"\n  },\n  {\n    \"column\": \"state\",\n    \"type\": \"text\"\n  },\n  {\n    \"column\": \"postal_code\",\n    \"type\": \"text\"\n  },\n  {\n    \"column\": \"model_year\",\n    \"type\": \"integer\"\n  },\n  {\n    \"column\": \"make\",\n    \"type\": \"text\"\n  },\n  {\n    \"column\": \"model\",\n    \"type\": \"text\"\n  },\n  {\n    \"column\": \"electric_vehicle_type\",\n    \"type\": \"text\"\n  },\n  {\n    \"column\": \"cafv_eligibility\",\n    \"type\": \"text\"\n  },\n  {\n    \"column\": \"electric_range\",\n    \"type\": \"integer\"\n  },\n  {\n    \"column\": \"base_msrp\",\n    \"type\": \"integer\"\n  },\n  {\n    \"column\": \"legislative_district\",\n    \"type\": \"integer\"\n  },\n  {\n    \"column\": \"dol_vehicle_id\",\n    \"type\": \"text\"\n  },\n  {\n    \"column\": \"vehicle_location\",\n    \"type\": \"text\"\n  },\n  {\n    \"column\": \"electric_utility\",\n    \"type\": \"text\"\n  },\n  {\n    \"column\": \"census_tract_2020\",\n    \"type\": \"text\"\n  }\n]"
+    }
+  ]
+}
+3. resources/list
+▼
+Request:
+
+{
+  "method": "resources/list",
+  "params": {}
+}
+Response:
+
+{
+  "resources": [
+    {
+      "uri": "postgres://admin@localhost:5431/vehicles/schema",
+      "name": "\"vehicles\" database schema",
+      "mimeType": "application/json"
+    },
+    {
+      "uri": "postgres://admin@localhost:5431/stations/schema",
+      "name": "\"stations\" database schema",
+      "mimeType": "application/json"
+    }
+  ]
+}
+2. tools/call
+▼
+Request:
+
+{
+  "method": "tools/call",
+  "params": {
+    "name": "query",
+    "arguments": {
+      "sql": "select * from vehicles limit 1;"
+    },
+    "_meta": {
+      "progressToken": 0
+    }
+  }
+}
+Response:
+
+{
+  "content": [
+    {
+      "type": "text",
+      "text": "[\n  {\n    \"vin\": \"5YJ3E1EA8P\",\n    \"county\": \"King\",\n    \"city\": \"Seattle\",\n    \"state\": \"WA\",\n    \"postal_code\": \"98103\",\n    \"model_year\": 2023,\n    \"make\": \"TESLA\",\n    \"model\": \"MODEL 3\",\n    \"electric_vehicle_type\": \"Battery Electric Vehicle (BEV)\",\n    \"cafv_eligibility\": \"Eligibility unknown as battery range has not been researched\",\n    \"electric_range\": 0,\n    \"base_msrp\": 0,\n    \"legislative_district\": 46,\n    \"dol_vehicle_id\": \"262385511\",\n    \"vehicle_location\": \"POINT (-122.35436 47.67596)\",\n    \"electric_utility\": \"CITY OF SEATTLE - (WA)|CITY OF TACOMA - (WA)\",\n    \"census_tract_2020\": \"53033002700\"\n  }\n]"
+    }
+  ],
+  "isError": false
+}
+1. tools/list
+▼
+Request:
+
+{
+  "method": "tools/list",
+  "params": {}
+}
+Response:
+
+{
+  "tools": [
+    {
+      "name": "query",
+      "description": "Run a read-only SQL query against the database.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "sql": {
+            "type": "string",
+            "description": "The SQL query to execute (must be read-only)."
+          }
+        },
+        "required": [
+          "sql"
+        ]
+      }
+    }
+  ]
+}
+
+

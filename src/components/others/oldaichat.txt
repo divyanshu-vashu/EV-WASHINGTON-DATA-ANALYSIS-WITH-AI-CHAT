@@ -1,0 +1,636 @@
+
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import {
+  GoogleGenerativeAI,
+  HarmCategory,
+  HarmBlockThreshold,
+  ChatSession,
+  GenerateContentResult,
+} from '@google/generative-ai';
+import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js';
+import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
+
+import '../App.css';
+import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
+import { ChatBubble, ChatBubbleAvatar, ChatBubbleMessage } from '@/components/ui/chat-bubble';
+
+// --- Configuration ---
+const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY;
+const MCP_SSE_URL = 'http://localhost:3001/sse';
+const MCP_POST_URL_BASE = 'http://localhost:3001/messages';
+const MCP_TOOL_NAME = 'query';
+
+// --- Interfaces ---
+interface Message {
+  sender: 'user' | 'ai' | 'system';
+  text: string;
+  isError?: boolean;
+}
+
+interface McpToolCall {
+  tool_call: {
+    name: string;
+    arguments: {
+      sql: string;
+    };
+  };
+}
+
+interface Tool {
+  name: string;
+  description?: string;
+  inputSchema?: {
+    type: string;
+    properties?: Record<string, unknown>;
+  };
+}
+
+// Type guard for MCP tool call responses
+function isMcpToolCall(response: unknown): response is McpToolCall {
+  if (typeof response !== 'object' || response === null) return false;
+
+  const resObj = response as { tool_call?: unknown };
+  const toolCall = resObj.tool_call;
+  if (typeof toolCall !== 'object' || toolCall === null) return false;
+
+  const { name, arguments: args } = toolCall as { name?: unknown; arguments?: unknown };
+  if (name !== MCP_TOOL_NAME) return false;
+  if (typeof args !== 'object' || args === null) return false;
+
+  const { sql } = args as { sql?: unknown };
+  return typeof sql === 'string';
+}
+
+// Add new interfaces for MCP resources
+interface McpResource {
+  uri: string;
+  name: string;
+  mimeType: string;
+}
+
+interface McpResourceContent {
+  uri: string;
+  mimeType: string;
+  text: string;
+}
+
+interface McpResourcesListResponse {
+  resources: McpResource[];
+}
+
+interface McpResourceReadResponse {
+  contents: McpResourceContent[];
+}
+
+function Aichat() {
+  const [messages, setMessages] = useState<Message[]>([
+    { sender: 'ai', text: "Hello! I'm your EV assistant. Ask me about electric vehicles or specific US EV stats!" },
+  ]);
+  const [inputValue, setInputValue] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const [mcpClient, setMcpClient] = useState<McpClient | null>(null);
+  const [geminiChat, setGeminiChat] = useState<ChatSession | null>(null);
+  // Add the missing state variables
+  const [mcpResources, setMcpResources] = useState<McpResource[]>([]);
+  const [mcpResourceContents, setMcpResourceContents] = useState<Record<string, string>>({});
+  const chatContainerRef = useRef<HTMLDivElement>(null);
+
+  // --- Initialization ---
+  useEffect(() => {
+    if (!GEMINI_API_KEY) {
+      setError('Error: GEMINI API KEY environment variable not set.');
+      console.error('Error: VITE_GEMINI_API_KEY environment variable not set. Create a .env file with VITE_GEMINI_API_KEY=YOUR_API_KEY');
+      return;
+    }
+
+    let isMounted = true;
+    let mcpTransport: SSEClientTransport | null = null;
+
+    async function initialize() {
+      setIsLoading(true);
+      setError(null);
+      console.log('Initializing...');
+
+      try {
+        // 1. Initialize Gemini
+        const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+        const model = genAI.getGenerativeModel({ model: 'gemini-2.5-pro-exp-03-25' });
+
+        const generationConfig = {
+          temperature: 0.8,
+          topK: 1,
+          topP: 1,
+          maxOutputTokens: 2048,
+        };
+
+        const safetySettings = [
+          { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE },
+        ];
+
+        const mcpQueryTool = {
+          name: MCP_TOOL_NAME,
+          description: `Executes a read-only SQL query against a database containing US EV registration data. Use this tool only when the user asks for specific statistical data (counts, averages, lists, rankings) about EV registrations, sales, makes, models, or locations within the US or specific US states. The database schema includes tables like 'vehicles' with columns such as 'vin', 'county', 'city', 'state', 'postal_code', 'model_year', 'make', 'model', 'electric_vehicle_type', 'electric_range', 'base_msrp'. Formulate a valid SQL query based on the user's request. Do NOT use INSERT, UPDATE, DELETE, or other modifying statements.`,
+          parameters: {
+            type: 'object',
+            properties: {
+              sql: {
+                type: 'string',
+                description: 'The read-only SQL query to execute.',
+              },
+            },
+            required: ['sql'],
+          },
+        };
+
+        const chat = model.startChat({
+          generationConfig,
+          safetySettings,
+          history: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: `You are an expert AI assistant specializing in Electric Vehicles (EVs). Your goal is to provide helpful information and guidance about EVs.
+
+You have access to a special tool called "${MCP_TOOL_NAME}" which can query a database of US EV registrations.
+
+Tool Details:
+- Name: ${mcpQueryTool.name}
+- Description: ${mcpQueryTool.description}
+- Input Schema: {"sql": "string"} (Provide the SQL query here)
+
+**IMPORTANT RULES:**
+1. Answer general EV questions directly based on your knowledge.
+2. If a user asks for specific data, statistics, counts, lists, or trends related to EV registrations, sales, makes, models, years, or locations within the washington dc or specific washington dc county, you MUST use the "${MCP_TOOL_NAME}" tool.
+3. When using the tool, first determine the correct SQL query based on the user's request and the known database schema.
+4. adding the resource of the mcp server , ${mcpResourceContents} ;
+
+5. To trigger the tool, respond ONLY with a JSON object matching this exact structure:
+   \`\`\`json
+   {
+     "tool_call": {
+       "name": "${MCP_TOOL_NAME}",
+       "arguments": {
+         "sql": "YOUR_GENERATED_SQL_QUERY_HERE"
+       }
+     }
+   }
+   \`\`\`
+6. Do NOT add any other text before or after this JSON structure when you intend to call the tool.
+7. i am attaching some distinct value from the database table for "county" ,"electric_vehicle_type", which help you solve more problem and reasoning capacity;
+   7.1 "electric_vehicle_type"
+"Plug-in Hybrid Electric Vehicle (PHEV)"
+"Battery Electric Vehicle (BEV)"
+
+    7.2 "cafv_eligibility"
+"Clean Alternative Fuel Vehicle Eligible"
+"Eligibility unknown as battery range has not been researched"
+"Not eligible due to low battery range"
+
+    7.3 "county" : it has 67 distinct value;
+"Kings","Jefferson","Grant","Cowlitz","Wahkiakum","Okanogan","Columbia","Kittitas","Wake","Walla Walla","Christian","Franklin","Maricopa","Ferry","Laramie","District of Columbia","Santa Clara","Pacific","Adams","Clallam","King","El Paso","Brevard","Lee","Pend Oreille","Chelan","San Juan","Benton","Snohomish","Asotin","Beaufort","Howard","Klickitat","Lincoln","Orange","Hardin","Grays Harbor","Pierce","Spokane","Meade","Harnett","Skamania","Whitman","Clark","Kitsap","Fairfax","Thurston","San Diego","Island","Mason","Skagit","DeKalb","Los Angeles","Anne Arundel","Douglas","Stevens","Lewis","Whatcom","Hamilton","Prince George's","San Mateo","Yakima","Currituck","Wasco","Calvert","Loudoun",
+
+8. If the user's request for data is unclear or too broad, ask clarifying questions before attempting to generate SQL.
+9. If the user asks for data outside the US washington dc, state that your database tool only covers washington dc and it's county.`,
+                },
+              ],
+            },
+            {
+              role: 'model',
+              parts: [
+                {
+                  text: "Understood. I am an EV assistant. I will answer general questions directly. For specific US EV registration data requests, I will generate the appropriate SQL query and respond with the required JSON structure to call the 'query' tool. I will ask for clarification if needed and inform the user if data outside the US is requested.",
+                },
+              ],
+            },
+          ],
+        });
+
+        if (isMounted) setGeminiChat(chat);
+        console.log('Gemini initialized.');
+
+        // 2. Initialize MCP Client via SSE
+        console.log(`Attempting to connect MCP Client via SSE to ${MCP_SSE_URL}...`);
+        // Pass the URL instance as the first argument.
+        mcpTransport = new SSEClientTransport(new URL(MCP_SSE_URL), {
+          // If there are additional options supported by your SDK,
+          // they can be included here (e.g., eventSourceInit, requestInit, authProvider).
+          // If "postUrlBase" is required, check the SDK documentation for the correct parameter name.
+        });
+
+        const client = new McpClient(
+          { name: 'ev-chatbot-client', version: '1.0.0' },
+          { capabilities: { tools: {} } }
+        );
+
+        await client.connect(mcpTransport);
+
+        // 3. Fetch MCP resources
+        console.log('Fetching MCP resources...');
+        try {
+          // List available resources
+          const resourcesListResult = await client.callTool({
+            name: 'resources/list',
+            arguments: {},
+          });
+          
+          if (resourcesListResult.isError) {
+            console.error('Error listing resources:', resourcesListResult.content);
+          } else if (
+            resourcesListResult.content && 
+            Array.isArray(resourcesListResult.content) && 
+            resourcesListResult.content.length > 0
+          ) {
+            try {
+              const resourcesData = JSON.parse(resourcesListResult.content[0].text) as McpResourcesListResponse;
+              console.log('Available resources:', resourcesData.resources);
+              
+              if (isMounted) setMcpResources(resourcesData.resources); console.log('Available resources:', resourcesData.resources);
+              
+              // Fetch content for each resource
+              const resourceContents: Record<string, string> = {};
+              
+              for (const resource of resourcesData.resources) {
+                const resourceReadResult = await client.callTool({
+                  name: 'resources/read',
+                  arguments: { uri: resource.uri },
+                });
+                
+                if (!resourceReadResult.isError && 
+                    resourceReadResult.content && 
+                    Array.isArray(resourceReadResult.content) && 
+                    resourceReadResult.content.length > 0
+                ) {
+                  try {
+                    const contentData = JSON.parse(resourceReadResult.content[0].text) as McpResourceReadResponse;
+                    if (contentData.contents && contentData.contents.length > 0) {
+                      resourceContents[resource.uri] = contentData.contents[0].text;
+                      console.log(`Fetched content for ${resource.name}`);
+                    }
+                  } catch (parseError) {
+                    console.error(`Error parsing resource content for ${resource.uri}:`, parseError);
+                  }
+                } else {
+                  console.error(`Error reading resource ${resource.uri}:`, resourceReadResult.content);
+                }
+              }
+              
+              if (isMounted) setMcpResourceContents(resourceContents); console.log('Available resources: content :->', resourceContents);
+              console.log('All resource contents fetched successfully');
+              
+              // Update the system prompt with the fetched resources
+              const resourcesText = Object.entries(resourceContents)
+                .map(([uri, content]) => {
+                  const resource = resourcesData.resources.find(r => r.uri === uri);
+                  return `Resource: ${resource?.name || uri}\n${content}`;
+                })
+                .join('\n\n');
+              
+              // Now update the system prompt in point 4
+              const updatedSystemPrompt = `You are an expert AI assistant specializing in Electric Vehicles (EVs). Your goal is to provide helpful information and guidance about EVs.
+
+You have access to a special tool called "${MCP_TOOL_NAME}" which can query a database of US EV registrations.
+
+Tool Details:
+- Name: ${mcpQueryTool.name}
+- Description: ${mcpQueryTool.description}
+- Input Schema: {"sql": "string"} (Provide the SQL query here)
+
+**IMPORTANT RULES:**
+1. Answer general EV questions directly based on your knowledge.
+2. If a user asks for specific data, statistics, counts, lists, or trends related to EV registrations, sales, makes, models, years, or locations within the washington dc or specific washington dc county, you MUST use the "${MCP_TOOL_NAME}" tool.
+3. When using the tool, first determine the correct SQL query based on the user's request and the known database schema.
+4. The resources of the MCP server are:
+${resourcesText}
+
+before writing sql command be within this baundry of the sql schema is provided below : 
+   \`\`\`sql
+   CREATE TABLE vehicles (
+  vin VARCHAR(10) PRIMARY KEY,
+  county TEXT,
+  city TEXT,
+  state TEXT,
+  postal_code TEXT,
+  model_year INT,
+  make TEXT,
+  model TEXT,
+  electric_vehicle_type TEXT,
+  cafv_eligibility TEXT,
+  electric_range INT,
+  base_msrp INT,
+  legislative_district INT,
+  dol_vehicle_id TEXT,
+  vehicle_location TEXT,
+  electric_utility TEXT,
+  census_tract_2020 TEXT
+);
+
+   \`\`\` and another table schema is for no of ev charing station in washington dc / washington dc county:
+   \`\`\`sql
+   CREATE TABLE stations (
+    County VARCHAR(255),
+    No_of_EV_Charging_Stations INT
+);
+
+   \`\`\``;
+              
+              // Create a new chat with the updated system prompt
+              const updatedChat = model.startChat({
+                generationConfig,
+                safetySettings,
+                history: [
+                  {
+                    role: 'user',
+                    parts: [{ text: updatedSystemPrompt }],
+                  },
+                  {
+                    role: 'model',
+                    parts: [
+                      {
+                        text: "Understood. I am an EV assistant. I will answer general questions directly. For specific US EV registration data requests, I will generate the appropriate SQL query and respond with the required JSON structure to call the 'query' tool. I will ask for clarification if needed and inform the user if data outside the US is requested.",
+                      },
+                    ],
+                  },
+                ],
+              });
+              
+              if (isMounted) setGeminiChat(updatedChat);
+              console.log('Gemini initialized with resource information.');
+            } catch (parseError) {
+              console.error('Error parsing resources list:', parseError);
+              if (isMounted) setGeminiChat(chat); // Fallback to original chat
+            }
+          }
+        } catch (resourceError) {
+          console.error('Error fetching MCP resources:', resourceError);
+          if (isMounted) setGeminiChat(chat); // Fallback to original chat
+        }
+
+        // Verify connection and available tools
+        try {
+          const tools = await client.listTools();
+          console.log('Available MCP Tools:', tools);
+          const availableTools = tools.tools as unknown as Tool[];
+          if (!availableTools.some((t) => t.name === MCP_TOOL_NAME)) {
+            throw new Error(`MCP Server connected, but required tool "${MCP_TOOL_NAME}" not found.`);
+          }
+        } catch (mcpError) {
+          console.error('Error during MCP post-connection check:', mcpError);
+          throw new Error(`Failed to verify connection with MCP server: ${
+            mcpError instanceof Error ? mcpError.message : String(mcpError)
+          }`);
+        }
+
+        if (isMounted) setMcpClient(client);
+        console.log('MCP Client connected successfully.');
+      } catch (err) {
+        console.error('Initialization failed:', err);
+        if (isMounted)
+          setError(`Initialization failed: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        if (isMounted) setIsLoading(false);
+      }
+    }
+
+    initialize();
+
+    // Cleanup function
+    return () => {
+      isMounted = false;
+      console.log('Cleaning up...');
+      // SSE connection will be automatically closed when the component unmounts.
+    };
+  }, []);
+
+  // --- Message Handling ---
+  const handleSendMessage = useCallback(async () => {
+    if (!inputValue.trim() || isLoading) return;
+
+    const userMessage: Message = { sender: 'user', text: inputValue };
+    setMessages((prev) => [...prev, userMessage]);
+    setInputValue('');
+    setIsLoading(true);
+    setError(null);
+  
+    if (!geminiChat || !mcpClient) {
+      setError('Error: AI or MCP connection not initialized.');
+      setIsLoading(false);
+      return;
+    }
+  
+    try {
+      console.log('Sending to Gemini:', userMessage.text);
+      const result: GenerateContentResult = await geminiChat.sendMessage(userMessage.text);
+      const response = result.response;
+      const responseText = response.text();
+      console.log('Gemini Raw Response:', responseText);
+  
+      let aiResponseText = '';
+      let requiresMcpCall = false;
+      let sqlQuery = '';
+  
+      // Improved JSON detection - handle markdown code blocks
+      try {
+        // Check if response is wrapped in markdown code blocks
+        const jsonMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+        
+        // If we found a JSON code block, parse its contents
+        if (jsonMatch && jsonMatch[1]) {
+          const jsonContent = jsonMatch[1].trim();
+          const potentialJson = JSON.parse(jsonContent);
+          
+          if (isMcpToolCall(potentialJson)) {
+            console.log('Detected MCP Tool Call instruction from Gemini (in code block).');
+            requiresMcpCall = true;
+            sqlQuery = potentialJson.tool_call.arguments.sql;
+            aiResponseText = `Okay, I need to fetch that data. Running the query: \`${sqlQuery}\``;
+          } else {
+            aiResponseText = responseText;
+          }
+        } else {
+          // Try direct JSON parsing as fallback
+          const potentialJson = JSON.parse(responseText);
+          if (isMcpToolCall(potentialJson)) {
+            console.log('Detected MCP Tool Call instruction from Gemini (direct JSON).');
+            requiresMcpCall = true;
+            sqlQuery = potentialJson.tool_call.arguments.sql;
+            aiResponseText = `Okay, I need to fetch that data. Running the query: \`${sqlQuery}\``;
+          } else {
+            aiResponseText = responseText;
+          }
+        }
+      } catch (e) {
+        console.log('Gemini response is not valid JSON, treating as text.');
+        aiResponseText = responseText;
+      }
+  
+      setMessages((prev) => [...prev, { sender: 'ai', text: aiResponseText }]);
+  
+      if (requiresMcpCall && sqlQuery) {
+        console.log(`Calling MCP tool '${MCP_TOOL_NAME}' with SQL: ${sqlQuery}`);
+        try {
+          const mcpResult = await mcpClient.callTool({
+            name: MCP_TOOL_NAME,
+            arguments: { sql: sqlQuery },
+          });
+          console.log('MCP Tool Result:', mcpResult);
+        
+
+          let mcpDataText = '';
+          if (mcpResult.isError) {
+            console.error('MCP Tool Error:', mcpResult.content);
+            const errorContent =
+              Array.isArray(mcpResult.content) && mcpResult.content.length > 0 && mcpResult.content[0].text
+                ? mcpResult.content[0].text
+                : 'Unknown error executing query.';
+            mcpDataText = `Error fetching data from the database: ${errorContent}`;
+            setMessages((prev) => [...prev, { sender: 'ai', text: mcpDataText, isError: true }]);
+          } else if (
+            mcpResult.content &&
+            Array.isArray(mcpResult.content) &&
+            mcpResult.content.length > 0 &&
+            mcpResult.content[0].text
+          ) {
+            try {
+              const data = JSON.parse(mcpResult.content[0].text);
+              const displayLimit = 10;
+              const truncatedData = Array.isArray(data) ? data.slice(0, displayLimit) : data;
+              let formattedData = JSON.stringify(truncatedData, null, 2);
+
+              if (Array.isArray(data) && data.length > displayLimit) {
+                formattedData += `\n\n...(truncated, ${data.length - displayLimit} more rows)`;
+              }
+
+              mcpDataText = `Here is the data I found:\n\`\`\`json\n${formattedData}\n\`\`\``;
+            } catch (parseError) {
+              console.warn('Could not parse MCP result JSON, showing raw text.');
+              mcpDataText = `Here is the data I found:\n${mcpResult.content[0].text}`;
+            }
+            setMessages((prev) => [...prev, { sender: 'ai', text: mcpDataText }]);
+          } else {
+            mcpDataText = "The query ran successfully, but returned no data or content.";
+            setMessages((prev) => [...prev, { sender: 'ai', text: mcpDataText }]);
+          }
+          
+        } catch (mcpError) {
+          console.error('Failed to call MCP tool:', mcpError);
+          const errorMessage = `Error communicating with the data server: ${
+            mcpError instanceof Error ? mcpError.message : String(mcpError)
+          }`;
+          setMessages((prev) => [...prev, { sender: 'ai', text: errorMessage, isError: true }]);
+          setError(errorMessage);
+        }
+      }
+    } catch (err) {
+      console.error('Error processing message:', err);
+      const errorMessage = `AI Error: ${err instanceof Error ? err.message : String(err)}`;
+      setMessages((prev) => [...prev, { sender: 'ai', text: errorMessage, isError: true }]);
+      setError(errorMessage);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [inputValue, isLoading, geminiChat, mcpClient]);
+
+  // Auto scroll when new messages arrive
+  const scrollToBottom = useCallback(() => {
+    if (chatContainerRef.current) {
+      chatContainerRef.current.scrollTop = chatContainerRef.current.scrollHeight;
+    }
+  }, []);
+
+  useEffect(() => {
+    scrollToBottom();
+  }, [messages, scrollToBottom]);
+
+  const handleKeyPress = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (event.key === 'Enter' && !isLoading) {
+      handleSendMessage();
+    }
+  };
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="p-3 border-b bg-primary/10 font-medium">
+        EV Assistant
+      </div>
+      
+      <div 
+        ref={chatContainerRef}
+        className="flex-1 overflow-y-auto p-3 space-y-3"
+        style={{ scrollbarWidth: 'thin' }}
+      >
+        {error && (
+          <div className="bg-destructive/20 text-destructive p-3 rounded-md">
+            {error}
+          </div>
+        )}
+        {!GEMINI_API_KEY && (
+          <div className="bg-destructive/20 text-destructive p-3 rounded-md">
+            GEMINI API KEY MISSING! Set VITE_GEMINI_API_KEY in .env
+          </div>
+        )}
+
+        {messages.map((msg, index) => (
+          <div 
+            key={index} 
+            className={`flex ${msg.sender === 'user' ? 'justify-end' : 'justify-start'} mb-2`}
+          >
+            <div 
+              className={`max-w-[80%] p-2 rounded-lg ${
+                msg.sender === 'user' 
+                  ? 'bg-primary text-primary-foreground' 
+                  : 'bg-muted'
+              } ${msg.isError ? 'bg-destructive/20 text-destructive' : ''}`}
+            >
+              {msg.text.split('```').map((part, i) =>
+                i % 2 === 1 ? (
+                  <pre key={i} className="bg-background/50 p-2 rounded text-xs overflow-x-auto my-1">
+                    <code>{part}</code>
+                  </pre>
+                ) : (
+                  <span key={i}>{part}</span>
+                )
+              )}
+            </div>
+          </div>
+        ))}
+
+        {isLoading && (
+          <div className="flex justify-start mb-2">
+            <div className="max-w-[80%] p-2 rounded-lg bg-muted">
+              <div className="flex space-x-1">
+                <div className="w-2 h-2 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: '0ms' }}></div>
+                <div className="w-2 h-2 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: '150ms' }}></div>
+                <div className="w-2 h-2 rounded-full bg-gray-400 animate-bounce" style={{ animationDelay: '300ms' }}></div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="p-3 border-t bg-background">
+        <div className="flex gap-2">
+          <Input
+            value={inputValue}
+            onChange={(e) => setInputValue(e.target.value)}
+            onKeyPress={handleKeyPress}
+            placeholder={(!mcpClient || !geminiChat) && !error ? "Initializing..." : "Ask about EVs..."}
+            disabled={isLoading || !mcpClient || !geminiChat || !!error}
+            className="flex-1"
+          />
+          <Button 
+            onClick={handleSendMessage}
+            disabled={isLoading || !inputValue.trim() || !mcpClient || !geminiChat || !!error}
+          >
+            {isLoading ? '...' : 'Send'}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default Aichat;
